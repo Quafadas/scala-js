@@ -17,6 +17,8 @@ import scala.concurrent.{ExecutionContext, Future}
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 
+import org.scalajs.linker.backend.OutputWriter.{computeContentHash, replaceAllBytes, toByteArray}
+
 import org.scalajs.logging.Logger
 
 import org.scalajs.linker._
@@ -87,16 +89,21 @@ final class WebAssemblyLinkerBackend(config: LinkerBackendImpl.Config)
 
     val outputImpl = OutputDirectoryImpl.fromOutputDirectory(output)
 
+    if (config.contentHash)
+      emitWithContentHash(moduleID, wasmModule, emitterResult, outputImpl)
+    else
+      emitWithoutContentHash(moduleID, wasmModule, emitterResult, outputImpl)
+  }
+
+  private def emitWithoutContentHash(moduleID: String, wasmModule: Modules.Module,
+      emitterResult: Emitter.Result, outputImpl: OutputDirectoryImpl)(
+      implicit ec: ExecutionContext): Future[Report] = {
     val watFileName = s"$moduleID.wat"
     val wasmFileName = s"$moduleID.wasm"
     val sourceMapFileName = s"$wasmFileName.map"
     val jsFileName = OutputPatternsImpl.jsFile(config.outputPatterns, moduleID)
 
-    val filesToProduce0 = Set(
-      wasmFileName,
-      loaderJSFileName,
-      jsFileName
-    )
+    val filesToProduce0 = Set(wasmFileName, loaderJSFileName, jsFileName)
     val filesToProduce1 =
       if (config.sourceMap) filesToProduce0 + sourceMapFileName
       else filesToProduce0
@@ -153,11 +160,96 @@ final class WebAssemblyLinkerBackend(config: LinkerBackendImpl.Config)
       _ <- writeJSFile()
     } yield {
       val reportModule = new ReportImpl.ModuleImpl(
-        moduleID,
-        jsFileName,
-        None,
-        coreSpec.moduleKind
-      )
+          moduleID, jsFileName, None, coreSpec.moduleKind)
+      new ReportImpl(List(reportModule))
+    }
+  }
+
+  /** Emits all wasm output files with content-hash-derived names.
+   *
+   *  The wasm binary content is hashed to derive file names for the `.wasm`
+   *  and `.js` files (and optionally the source map). The JS file's reference
+   *  to the wasm file is updated to point at the hashed `.wasm` name. When
+   *  source maps are enabled the wasm binary is re-emitted with the correct
+   *  hashed source map URI embedded in its custom section.
+   */
+  private def emitWithContentHash(moduleID: String, wasmModule: Modules.Module,
+      emitterResult: Emitter.Result, outputImpl: OutputDirectoryImpl)(
+      implicit ec: ExecutionContext): Future[Report] = {
+    val emitDebugInfo = !config.minify
+
+    /* Step 1: Emit the wasm binary without a source-map section so we can
+     * compute its content hash without a circular dependency on the (as-yet
+     * unknown) hashed source-map file name.
+     */
+    val wasmBytesForHash = toByteArray(BinaryWriter.write(wasmModule, emitDebugInfo))
+    val wasmHash = computeContentHash(wasmBytesForHash)
+
+    val hashedModuleIDStr = s"$moduleID.$wasmHash"
+    val hashedWasmFileName = s"$hashedModuleIDStr.wasm"
+    val hashedSourceMapFileName = s"$hashedWasmFileName.map"
+    val hashedJSFileName = OutputPatternsImpl.jsFile(config.outputPatterns, hashedModuleIDStr)
+    val watFileName = s"$hashedModuleIDStr.wat"
+
+    /* Step 2: Update the JS file content so that its __load(...) call
+     * references the hashed wasm file name instead of the plain one.
+     * The default internalWasmFileURIPattern embeds "./<moduleID>.wasm" exactly
+     * once as the first argument to __load(); replacing all occurrences is safe.
+     */
+    val origWasmURI = s"./$moduleID.wasm"
+    val hashedWasmURI = s"./$hashedWasmFileName"
+    val updatedJSBytes = replaceAllBytes(
+        emitterResult.jsFileContent,
+        origWasmURI.getBytes(StandardCharsets.UTF_8),
+        hashedWasmURI.getBytes(StandardCharsets.UTF_8))
+
+    /* Step 3: Produce the final wasm binary.
+     * When source maps are enabled we re-emit (a second BinaryWriter pass)
+     * with the now-known hashed source-map URI embedded in the custom section,
+     * and with the source-map writer recording the hashed wasm file URI.
+     */
+    val (finalWasmBuffer, finalSourceMapBuffer) = if (config.sourceMap) {
+      val sourceMapWriter = new ByteArrayWriter
+      val smWriter = new SourceMapWriter(sourceMapWriter, s"./$hashedWasmFileName",
+          config.relativizeSourceMapBase, fragmentIndex)
+      val wasmBuffer = BinaryWriter.writeWithSourceMap(
+          wasmModule, emitDebugInfo, smWriter, s"./$hashedSourceMapFileName")
+      smWriter.complete()
+      (wasmBuffer, Some(sourceMapWriter.toByteBuffer()))
+    } else {
+      (ByteBuffer.wrap(wasmBytesForHash), None)
+    }
+
+    val filesToProduce0 = Set(hashedWasmFileName, loaderJSFileName, hashedJSFileName)
+    val filesToProduce1 =
+      if (config.sourceMap) filesToProduce0 + hashedSourceMapFileName
+      else filesToProduce0
+    val filesToProduce =
+      if (config.prettyPrint) filesToProduce1 + watFileName
+      else filesToProduce1
+
+    def maybeWriteWatFile(): Future[Unit] = {
+      if (config.prettyPrint) {
+        val textOutput = TextWriter.write(wasmModule)
+        val textOutputBytes = textOutput.getBytes(StandardCharsets.UTF_8)
+        outputImpl.writeFull(watFileName, ByteBuffer.wrap(textOutputBytes))
+      } else {
+        Future.unit
+      }
+    }
+
+    for {
+      existingFiles <- outputImpl.listFiles()
+      _ <- Future.sequence(existingFiles.filterNot(filesToProduce).map(outputImpl.delete(_)))
+      _ <- maybeWriteWatFile()
+      _ <- outputImpl.writeFull(hashedWasmFileName, finalWasmBuffer)
+      _ <- finalSourceMapBuffer.fold(Future.unit)(buf =>
+          outputImpl.writeFull(hashedSourceMapFileName, buf))
+      _ <- outputImpl.writeFull(loaderJSFileName, ByteBuffer.wrap(emitterResult.loaderContent))
+      _ <- outputImpl.writeFull(hashedJSFileName, ByteBuffer.wrap(updatedJSBytes))
+    } yield {
+      val reportModule = new ReportImpl.ModuleImpl(
+          moduleID, hashedJSFileName, None, coreSpec.moduleKind)
       new ReportImpl(List(reportModule))
     }
   }
